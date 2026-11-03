@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# clone-to-new-ssd — copy a whole disk onto a bigger one, verify it byte-for-byte,
+# then move the GPT backup header to the end of the new disk.
+#
+# Disks are identified by serial number / model / exact size, never by /dev/sdX names,
+# so the copy can't go the wrong way. It refuses to run while any partition of the
+# source disk is mounted read-write (run it from a Live USB or emergency mode).
+#
+# Usage:
+#   clone-to-new-ssd --list
+#   clone-to-new-ssd [--check] --src-serial SERIAL --tgt-model MODEL --tgt-sectors N [--usb-quirk VID:PID:u]
+#
+# Options can also come from a config file (shell syntax, see clone.conf.example):
+#   --config FILE, $CLONE_CONF, /etc/clone-to-new-ssd.conf, or clone.conf next to this script.
+# Command-line options override the config file.
+set -uo pipefail
+
+LOG=/run/clone-to-new-ssd.log
+SRC_SERIAL=""; TGT_MODEL=""; TGT_SECTORS=""; USB_QUIRK=""
+
+red(){ printf '\e[1;31m%s\e[0m\n' "$*"; }; grn(){ printf '\e[1;32m%s\e[0m\n' "$*"; }
+die(){ red "ABORT: $*"; red "Nothing was written."; exit 1; }
+trim(){ sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$1" 2>/dev/null; }
+usage(){ awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,"");print}' "$0"; exit "${1:-1}"; }
+
+disk_serial(){ local s; s=$(trim /sys/block/$1/device/serial); [[ -z $s ]] && s=$(lsblk -dno SERIAL /dev/$1 2>/dev/null); echo "$s"; }
+disk_model(){ trim /sys/block/$1/device/model; }
+disk_driver(){ local dev; dev=$(readlink -f /sys/block/$1/device); [[ $dev == */host* ]] && basename "$(readlink -f "${dev%/host*}/driver")" || echo "-"; }
+all_disks(){ for d in /sys/block/nvme*n* /sys/block/sd* /sys/block/vd*; do [[ -e $d/device ]] && basename "$d"; done; }
+
+list_disks(){
+  printf '%-10s %-26s %-22s %12s %8s  %s\n' DEVICE MODEL SERIAL SECTORS GiB DRIVER
+  for n in $(all_disks); do
+    s=$(cat /sys/block/$n/size)
+    printf '%-10s %-26s %-22s %12s %8s  %s\n' "$n" "$(disk_model $n)" "$(disk_serial $n)" "$s" "$((s*512/1024/1024/1024))" "$(disk_driver $n)"
+  done
+  echo; echo "Use SERIAL of the disk to copy FROM, and MODEL + SECTORS of the disk to copy TO."
+}
+
+# --- options ------------------------------------------------------------------
+CHECK=0; CONF="${CLONE_CONF:-}"; ARGS=("$@")
+for ((i=0; i<${#ARGS[@]}; i++)); do [[ ${ARGS[i]} == --config ]] && CONF=${ARGS[i+1]:-}; done
+if [[ -z $CONF ]]; then
+  for f in /etc/clone-to-new-ssd.conf "$(dirname "$(readlink -f "$0")")/clone.conf"; do [[ -r $f ]] && { CONF=$f; break; }; done
+fi
+[[ -n $CONF ]] && { [[ -r $CONF ]] || die "config $CONF not readable"; . "$CONF"; }
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --list) list_disks; exit 0 ;;
+    --check) CHECK=1 ;;
+    --config) shift ;;
+    --src-serial) SRC_SERIAL=$2; shift ;;
+    --tgt-model) TGT_MODEL=$2; shift ;;
+    --tgt-sectors) TGT_SECTORS=$2; shift ;;
+    --usb-quirk) USB_QUIRK=$2; shift ;;
+    -h|--help) usage 0 ;;
+    *) red "unknown option: $1"; usage ;;
+  esac; shift
+done
+[[ -n $SRC_SERIAL && -n $TGT_MODEL && $TGT_SECTORS =~ ^[0-9]+$ ]] \
+  || { red "Missing --src-serial / --tgt-model / --tgt-sectors (run with --list to see your disks)."; usage; }
+[[ $EUID -eq 0 || $CHECK -eq 1 ]] || die "run as root (sudo)"
+
+find_src(){ for n in $(all_disks); do [[ "$(disk_serial $n)" == "$SRC_SERIAL" ]] && { echo $n; return; }; done; }
+find_tgt(){ for n in $(all_disks); do [[ "$(disk_model $n)" == "$TGT_MODEL" && "$(cat /sys/block/$n/size)" == "$TGT_SECTORS" ]] && { echo $n; return; }; done; }
+
+# --- 1. optional USB driver workaround (e.g. JMicron JMS583: 152d:a583:u) -----
+if [[ -n $USB_QUIRK && $CHECK -eq 0 ]]; then
+  modprobe usb-storage 2>/dev/null
+  q=/sys/module/usb_storage/parameters/quirks
+  grep -q "$USB_QUIRK" $q 2>/dev/null || echo "$USB_QUIRK" > $q || die "could not set usb-storage quirk"
+  modprobe uas 2>/dev/null
+fi
+
+# --- 2. find the disks --------------------------------------------------------
+SRC=$(find_src); [[ -n "$SRC" ]] || die "source disk (serial $SRC_SERIAL) not found — run --list"
+TGT=$(find_tgt)
+if [[ -z "$TGT" ]]; then
+  echo "Waiting up to 60 s for the target disk (plug in the enclosure now if it isn't)..."
+  for i in $(seq 60); do TGT=$(find_tgt); [[ -n "$TGT" ]] && break; sleep 1; done
+fi
+[[ -n "$TGT" ]] || die "target disk ($TGT_MODEL, $TGT_SECTORS sectors) not found — run --list"
+
+DRV=$(disk_driver $TGT)
+while [[ -n $USB_QUIRK && "$DRV" == "uas" ]]; do
+  [[ $CHECK -eq 1 ]] && { red "WARN: target is on the 'uas' driver (a real run would ask you to replug it)"; break; }
+  red "The target enclosure is using the 'uas' driver (the one that freezes)."
+  read -rp "Unplug the enclosure, wait 5 s, plug it back in, then press Enter... " _
+  TGT=""; for i in $(seq 30); do TGT=$(find_tgt); [[ -n "$TGT" ]] && break; sleep 1; done
+  [[ -n "$TGT" ]] || die "target disk did not come back"
+  DRV=$(disk_driver $TGT)
+done
+
+SRC_DEV=/dev/$SRC; TGT_DEV=/dev/$TGT
+SRC_BYTES=$(( $(cat /sys/block/$SRC/size) * 512 ))
+TGT_BYTES=$(( $(cat /sys/block/$TGT/size) * 512 ))
+
+# --- 3. safety checks ---------------------------------------------------------
+OK=1; fail(){ red "FAIL: $*"; OK=0; }
+[[ "$SRC" != "$TGT" ]] || fail "source and target are the same device"
+(( TGT_BYTES >= SRC_BYTES )) || fail "target is smaller than source"
+while read -r src opts; do
+  [[ "$src" == "$SRC_DEV"* && "${opts%%,*}" != "ro" ]] && fail "$src (source) is mounted read-write"
+  [[ "$src" == "$TGT_DEV"* ]] && fail "$src (target) is mounted"
+done < <(findmnt -rno SOURCE,OPTIONS | sed 's/\[[^]]*\]//')
+
+cat <<EOF
+
+  SOURCE (copy FROM): $SRC_DEV  $(disk_model $SRC)  serial $(disk_serial $SRC)  $((SRC_BYTES/1024/1024/1024)) GiB
+  TARGET (copy TO):   $TGT_DEV  $(disk_model $TGT)  $((TGT_BYTES/1024/1024/1024)) GiB  driver: $DRV
+  Everything on the TARGET will be overwritten. The SOURCE is only read.
+
+EOF
+if [[ $CHECK -eq 1 ]]; then
+  [[ $OK -eq 1 ]] && grn "Check passed." || red "Check found problems (expected if you run --check from the running system)."
+  exit 0
+fi
+[[ $OK -eq 1 ]] || die "safety checks failed"
+
+read -rp "Type YES to start copying: " ans
+[[ "$ans" == "YES" ]] || die "not confirmed"
+
+exec > >(tee -a $LOG) 2>&1
+# --- 4. copy ------------------------------------------------------------------
+echo "[$(date +%T)] Copying $SRC_DEV -> $TGT_DEV ..."
+dd if=$SRC_DEV of=$TGT_DEV bs=64M iflag=fullblock conv=fsync status=progress \
+  || { red "dd FAILED. Do NOT swap the drives. The source disk is untouched."; exit 1; }
+sync; blockdev --flushbufs $SRC_DEV $TGT_DEV; echo 3 > /proc/sys/vm/drop_caches
+
+# --- 5. verify ----------------------------------------------------------------
+echo "[$(date +%T)] Verifying byte-for-byte (takes about as long as the copy)..."
+if cmp -n $SRC_BYTES $SRC_DEV $TGT_DEV; then
+  grn "[$(date +%T)] IDENTICAL - the copy is perfect."
+else
+  red "VERIFY FAILED - the copy differs. Do NOT swap the drives. The source disk is untouched."
+  exit 1
+fi
+
+# --- 6. move the GPT backup header to the end of the bigger disk --------------
+echo "[$(date +%T)] Fixing the partition table to span the whole new disk..."
+sfdisk --relocate gpt-bak-std $TGT_DEV || red "WARN: sfdisk relocate failed (growpart can fix it after the swap)"
+sync
+sfdisk -l $TGT_DEV | head -20
+
+grn "
+DONE. Next:
+  1. Power off:  poweroff   (or: poweroff -f  if you booted with init=/bin/bash)
+  2. Swap the drives (new SSD into the laptop's M.2 slot). Never boot with both attached.
+  3. Boot normally, then grow the main partition — see docs/cloning-and-migrating.md, step 5."

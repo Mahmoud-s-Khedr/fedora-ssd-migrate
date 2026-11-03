@@ -1,0 +1,12 @@
+# Config for clone-to-new-ssd (shell syntax). Copy to /etc/clone-to-new-ssd.conf
+# or to clone.conf next to the script. Get the values from: sudo clone-to-new-ssd --list
+
+# Serial of the disk to copy FROM (your current system disk)
+SRC_SERIAL="XXXXXXXXXXXXXXX"
+
+# Model and exact size in 512-byte sectors of the disk to copy TO
+TGT_MODEL="GEND 710"
+TGT_SECTORS=1000215216
+
+# Optional: usb-storage quirk for a buggy USB bridge (JMicron JMS583 shown). Leave empty if not needed.
+USB_QUIRK="152d:a583:u"
